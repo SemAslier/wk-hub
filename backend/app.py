@@ -99,6 +99,12 @@ LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
 if not isinstance(LOG_LEVEL, int):
     LOG_LEVEL = logging.INFO
 PREDICTION_LOCK_BEFORE_KICKOFF = timedelta(hours=1)
+# Matches separated by less than this gap belong to the same playing session.
+# World Cup 2026 matches are often played overnight (Dutch time): the early-hours
+# kickoffs of the next calendar day are part of the same matchday for NL viewers.
+# Overnight gaps are ~6-8h; the daytime gap to the next evening session is much
+# larger, so this threshold cleanly separates one matchday from the next.
+MATCHDAY_SESSION_GAP = timedelta(hours=12)
 NETHERLANDS_TEAM_ID = "ned"
 AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
 LEEUWTJES_LIMIT = 5
@@ -3660,7 +3666,6 @@ def build_matchday_summary(
 ) -> dict[str, Any]:
     current = now or utc_now()
     today = current.astimezone(AMSTERDAM_TZ).date()
-    window_end = current + timedelta(hours=24)
     matches_with_dates = [(local_match_date(match), match) for match in data["matches"]]
     match_dates = sorted({match_date for match_date, _ in matches_with_dates})
     target_date = today if today in match_dates else None
@@ -3672,24 +3677,24 @@ def build_matchday_summary(
     if target_date is None:
         return {"available": False, "matches": []}
 
-    # Also include the next calendar date if any of its matches fall within 24 hours,
-    # so late-night matches (Dutch time) are always visible.
-    target_dates = {target_date}
-    later_dates = [d for d in match_dates if d > target_date]
-    if later_dates:
-        next_date = later_dates[0]
-        if any(
-            match_kickoff(m) <= window_end
-            for d, m in matches_with_dates
-            if d == next_date
-        ):
-            target_dates.add(next_date)
-
-    target_matches = [
-        match
-        for match_date, match in matches_with_dates
-        if match_date in target_dates and match.get("home_team_id") and match.get("away_team_id")
-    ]
+    # Build the matchday as a "playing session": start from the target date's
+    # matches, then keep absorbing later matches while the gap to the previous
+    # kickoff stays under MATCHDAY_SESSION_GAP. This rolls overnight matches that
+    # fall on the next calendar day (Dutch time) into the same matchday, while the
+    # large daytime gap stops the session before the next evening's matches.
+    ordered = sorted(matches_with_dates, key=lambda item: match_kickoff(item[1]))
+    target_matches = []
+    previous_kickoff: datetime | None = None
+    for match_date, match in ordered:
+        if match_date < target_date:
+            continue
+        kickoff = match_kickoff(match)
+        if match_date > target_date:
+            if previous_kickoff is None or kickoff - previous_kickoff >= MATCHDAY_SESSION_GAP:
+                break
+        previous_kickoff = kickoff
+        if match.get("home_team_id") and match.get("away_team_id"):
+            target_matches.append(match)
     target_ids = {match["id"] for match in target_matches}
 
     with get_db() as conn:
